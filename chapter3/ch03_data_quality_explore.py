@@ -19,7 +19,16 @@ Install:
 """
 
 import random
+import warnings
 from collections import Counter
+
+# Suppress known bitsandbytes FutureWarning spam from PyTorch internals.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*_check_is_size will be removed in a future PyTorch release.*",
+    category=FutureWarning,
+    module=r"bitsandbytes\._ops",
+)
 
 from ch03_data_quality_helpers import (
     load_phrasebank_split,

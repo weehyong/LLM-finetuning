@@ -24,6 +24,8 @@ import os
 import json
 import random
 import zipfile
+import builtins
+from contextlib import contextmanager
 from collections import Counter
 
 from huggingface_hub import hf_hub_download
@@ -51,6 +53,29 @@ SYSTEM_PROMPT = (
     "You are a financial analyst. Classify the sentiment of financial statements.\n"
     "Respond with exactly one word: positive, negative, or neutral."
 )
+
+_UNSLOTH_SUPPRESSED_PRINT_SNIPPETS = (
+    "Unsloth: Your Flash Attention 2 installation seems to be broken.",
+    "Using Xformers instead. No performance changes will be seen.",
+)
+
+
+@contextmanager
+def _suppress_unsloth_flashattn_notice():
+    """Temporarily suppress noisy Unsloth FlashAttention fallback print lines."""
+    original_print = builtins.print
+
+    def filtered_print(*args, **kwargs):
+        message = " ".join(str(a) for a in args)
+        if any(snippet in message for snippet in _UNSLOTH_SUPPRESSED_PRINT_SNIPPETS):
+            return
+        return original_print(*args, **kwargs)
+
+    builtins.print = filtered_print
+    try:
+        yield
+    finally:
+        builtins.print = original_print
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -230,19 +255,21 @@ def train_condition(
     Returns:
         Path to the saved checkpoint directory
     """
-    from unsloth import FastModel
-    from unsloth.chat_templates import get_chat_template
+    with _suppress_unsloth_flashattn_notice():
+        from unsloth import FastModel
+        from unsloth.chat_templates import get_chat_template
     from trl import SFTTrainer, SFTConfig
 
     output_dir = os.path.join(output_base, condition_key)
     os.makedirs(output_dir, exist_ok=True)
 
     # Fresh model load for each condition — no weight sharing between runs
-    model, tokenizer = FastModel.from_pretrained(
-        model_name=MODEL_NAME,
-        max_seq_length=MAX_SEQ_LENGTH,
-        load_in_4bit=LOAD_IN_4BIT,
-    )
+    with _suppress_unsloth_flashattn_notice():
+        model, tokenizer = FastModel.from_pretrained(
+            model_name=MODEL_NAME,
+            max_seq_length=MAX_SEQ_LENGTH,
+            load_in_4bit=LOAD_IN_4BIT,
+        )
     tokenizer = get_chat_template(tokenizer, chat_template="qwen-2.5")
 
     # LoRA adapter — same rank/alpha for every condition
@@ -322,19 +349,29 @@ def evaluate_condition(
     Returns:
         dict with accuracy, macro_f1, per_class_f1, and predictions list
     """
-    from unsloth import FastModel
-    from unsloth.chat_templates import get_chat_template
+    with _suppress_unsloth_flashattn_notice():
+        from unsloth import FastModel
+        from unsloth.chat_templates import get_chat_template
     from sklearn.metrics import accuracy_score, f1_score
+    from transformers import GenerationConfig
 
     import torch
 
-    model, tokenizer = FastModel.from_pretrained(
-        model_name=checkpoint_path,
-        max_seq_length=MAX_SEQ_LENGTH,
-        load_in_4bit=LOAD_IN_4BIT,
-    )
+    with _suppress_unsloth_flashattn_notice():
+        model, tokenizer = FastModel.from_pretrained(
+            model_name=checkpoint_path,
+            max_seq_length=MAX_SEQ_LENGTH,
+            load_in_4bit=LOAD_IN_4BIT,
+        )
     tokenizer = get_chat_template(tokenizer, chat_template="qwen-2.5")
     FastModel.for_inference(model)
+
+    # Avoid repeated warning: do not keep both max_length and max_new_tokens.
+    gen_cfg = GenerationConfig.from_model_config(model.config)
+    gen_cfg.max_new_tokens = 5
+    gen_cfg.max_length = None
+    gen_cfg.do_sample = False
+    gen_cfg.temperature = 1.0
 
     gold_labels = [ex["label"] for ex in test_examples]
     predictions = []
@@ -354,9 +391,7 @@ def evaluate_condition(
         inputs  = tokenizer(prompt, return_tensors="pt").to("cuda")
         outputs = model.generate(
             **inputs,
-            max_new_tokens=5,
-            do_sample=False,
-            temperature=1.0,
+            generation_config=gen_cfg,
         )
         # Decode only the tokens the model generated (not the prompt)
         response = tokenizer.decode(
